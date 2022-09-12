@@ -337,7 +337,7 @@ func (rf *Raft) loop() {
 			//   chanHasVoted  <- RequestVote
 			case <- rf.chanHasVoted:
 			case <- rf.chanHeartbeat:
-			case <- time.After(time.Millisecond * time.Duration(rand.Intn(300) + 200)):
+			case <- time.After(200 * time.Millisecond):
 				atomic.StoreInt32(&rf.status, StatusCandidate)
 			}
 		case StatusLeader:
