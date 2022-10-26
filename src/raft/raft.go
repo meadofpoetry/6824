@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
 	"math"
 	"math/rand"
@@ -28,8 +29,17 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
+
+func min(x, y int) int {
+	if x < y {
+		return x
+	} else {
+		return y
+	}
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -196,14 +206,13 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.mlog)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -216,17 +225,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	var currentTerm int
+	var votedFor    int
+	var log         []LogEntry
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		panic("Can't retrieve persisted data")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.mlog = log
+	}
 }
 
 
@@ -265,6 +277,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -276,7 +289,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.status = StatusFollower
 		rf.setTerm(args.Term)
-		reply.VoteGranted = true
 	}
 
 	lastLogTerm := rf.getLastLogTerm()
@@ -310,15 +322,20 @@ type AppendEntitiesArgs struct {
 type AppendEntitiesReply struct {
 	Term           int
 	Success        bool
+	// Used to optimize index decrement,
+	// avoinding many decrements by one
+	ActualIndex    int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntitiesArgs, reply *AppendEntitiesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.ActualIndex = rf.getLastLogIndex()
 		return
 	}
 	
@@ -331,15 +348,27 @@ func (rf *Raft) AppendEntries(args *AppendEntitiesArgs, reply *AppendEntitiesRep
 
 	reply.Term = rf.currentTerm
 
+	// Not enough entries in log, ask for more
 	if len(rf.mlog) < args.PrevLogIndex + 1 {
 		reply.Success = false
+		reply.ActualIndex = rf.getLastLogIndex() + 1
 		return
 	}
 	
 	finalEntry := rf.mlog[args.PrevLogIndex]
-
+	// Mismatching term of last known entry,
+	// should rewrite log, hence asking for more
 	if finalEntry.Term != args.PrevLogTerm {
 		reply.Success = false
+
+		// Scanning looking for first matching entry
+		for i := args.PrevLogIndex; i >= 0; i-- {
+			if rf.mlog[i].Term != finalEntry.Term {
+				reply.ActualIndex = i + 1
+				break
+			}
+		}
+		
 		return
 	}
 
@@ -476,10 +505,10 @@ func (rf *Raft) proposeVote(peer int, request *RequestVoteArgs) {
 			if atomic.AddInt64(&rf.totalVotes, 1) > int64(len(rf.peers) / 2) {
 				rf.log("Has become a leader")
 				rf.status = StatusLeader
-				lastLogIndex := rf.getLastLogIndex() + 1
+				nextIndex := rf.getLastLogIndex() + 1
 				for i := range rf.peers {
 					rf.matchIndex[i] = 0
-					rf.nextIndex[i] = lastLogIndex
+					rf.nextIndex[i] = nextIndex
 				}
 				rf.chanBecomeLeader <- true
 			}
@@ -517,6 +546,7 @@ func (rf *Raft) appendEntry(peer int, request *AppendEntitiesArgs) {
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+		defer rf.persist()
 		
 		if rf.status.Load() != StatusLeader {
 			return
@@ -529,7 +559,7 @@ func (rf *Raft) appendEntry(peer int, request *AppendEntitiesArgs) {
 		}
 
 		if !reply.Success {
-			rf.nextIndex[peer] -= 1
+			rf.nextIndex[peer] = min(reply.ActualIndex, rf.getLastLogIndex())
 			return
 		}
 
@@ -652,6 +682,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.log("(re)started with state: Status: %s, Committed: %d, Log: %s", rf.status, rf.commitIndex, rf.mlog)
 
 	// start ticker goroutine to start elections
 	go rf.loop()
