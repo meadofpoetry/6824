@@ -1,13 +1,22 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	//"fmt"
+	"math/big"
+	"sync/atomic"
+
+	"6.824/labrpc"
+)
 
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	servers     []*labrpc.ClientEnd
+
+	leader      int64
+
+	clientId    ClientId
+	nextRequest RequestId
 }
 
 func nrand() int64 {
@@ -17,10 +26,36 @@ func nrand() int64 {
 	return x
 }
 
+func (ck *Clerk) nextRequestId() RequestId {
+	return RequestId(atomic.AddUint64((*uint64)(&ck.nextRequest), 1))
+}
+
+func (ck *Clerk) shiftLeader() {
+	nextLeader := (ck.leader + 1) % int64(len(ck.servers))
+	atomic.StoreInt64(&ck.leader, nextLeader)
+}
+
+func (ck *Clerk) call(call string, args interface{}, reply Statuser) {
+	for {
+		leader := atomic.LoadInt64(&ck.leader)
+		ok := ck.servers[leader].Call(call, args, reply)
+		if ok && reply.Status() != ErrWrongLeader {
+			break
+		}
+		reply.Clean()
+		ck.shiftLeader()
+	}
+}
+
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+
+	ck.leader = 0
+
+	ck.clientId = ClientId(nrand())
+	ck.nextRequest = 1
+	
 	return ck
 }
 
@@ -37,9 +72,14 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	args := GetArgs{Key: key, CId: ck.clientId, RId: ck.nextRequestId()}
+	reply := GetReply{}
+	
+	ck.call("KVServer.Get", &args, &reply)
 
-	// You will have to modify this function.
-	return ""
+	//fmt.Printf("[%d] %s Get: %s -> %s\n", args.CId, reply.Err, args.Key, reply.Value)
+	
+	return reply.Value
 }
 
 //
@@ -53,7 +93,12 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	args := PutAppendArgs{Key: key, Value: value, Op: op, CId: ck.clientId, RId: ck.nextRequestId()}
+	reply := PutAppendReply{}
+	
+	ck.call("KVServer.PutAppend", &args, &reply)
+
+	//fmt.Printf("[%d] %s %s: %s -> %s\n", args.CId, reply.Err, args.Op, args.Key, args.Value)
 }
 
 func (ck *Clerk) Put(key string, value string) {

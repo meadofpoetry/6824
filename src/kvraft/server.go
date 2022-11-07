@@ -1,12 +1,15 @@
 package kvraft
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
-	"6.824/raft"
+	//"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
 )
 
 const Debug = false
@@ -18,11 +21,31 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type Index int
+
+type OpKind int
+
+const (
+	OpGet    OpKind = 0
+	OpPut    OpKind = 1
+	OpAppend OpKind = 2
+)
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Operation OpKind
+	Key       string
+	Value     string
+
+	CId       ClientId
+	RId       RequestId
+}
+
+type OpResult struct {
+	Value     string
+	Exists    bool
+
+	CId       ClientId
+	RId       RequestId
 }
 
 type KVServer struct {
@@ -34,16 +57,131 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	// State
+	state   map[string]string
+	// Response subscriptions and deduplication
+	// RequestId are sequential, thus
+	// we can deduplicate fulfilled requests
+	subs    map[Index]chan OpResult
+	reqIds  map[ClientId]RequestId
 }
 
+func (kv *KVServer) apply(msg raft.ApplyMsg) {
+	if !msg.CommandValid {
+		return
+	}
+
+	index := msg.CommandIndex
+	op := msg.Command.(Op)
+	result := OpResult{CId: op.CId, RId: op.RId}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	
+	if op.Operation == OpGet {
+		v, exists := kv.state[op.Key]
+		result.Value = v
+		result.Exists = exists
+	} else { // Put|Append
+		lastId, exists := kv.reqIds[op.CId]
+		if !exists || op.RId > lastId {
+			kv.reqIds[op.CId] = op.RId
+			if op.Operation == OpPut {
+				kv.state[op.Key] = op.Value
+			} else {
+				kv.state[op.Key] = kv.state[op.Key] + op.Value
+			}
+		}
+	}
+
+	resultCh, stillWaiting := kv.subs[Index(index)]
+	if !stillWaiting {
+		return
+	}
+	resultCh <- result
+}
+
+func (kv *KVServer) append(op Op) (bool, *OpResult) {
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return false, nil
+	}
+
+	kv.mu.Lock()
+	resultCh, exists := kv.subs[Index(index)]
+	if !exists {
+		resultCh = make(chan OpResult)
+		kv.subs[Index(index)] = resultCh
+	}
+	kv.mu.Unlock()
+	
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.subs, Index(index))
+		kv.mu.Unlock()
+	}()
+	
+	select {
+	case result := <- resultCh:
+		if result.CId != op.CId || result.RId != op.RId {
+			return false, nil
+		}
+		return true, &result
+		
+	case <- time.After(500 * time.Millisecond):
+		return false, nil
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	op := Op {
+		Operation: OpGet,
+		Key: args.Key,
+		CId: args.CId,
+		RId: args.RId,
+	}
+
+	ok, result := kv.append(op)
+
+	if !ok {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	if !result.Exists {
+		reply.Err = ErrNoKey
+		return
+	}
+
+	reply.Err = OK
+	reply.Value = result.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	var operation OpKind
+
+	if args.Op == "Put" {
+		operation = OpPut
+	} else {
+		operation = OpAppend
+	}
+	
+	op := Op {
+		Operation: operation,
+		Key: args.Key,
+		Value: args.Value,	
+		CId: args.CId,
+		RId: args.RId,
+	}
+
+	ok, _ := kv.append(op)
+
+	if !ok {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	reply.Err = OK
 }
 
 //
@@ -59,12 +197,31 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) loop() {
+	waitTime := 100 * time.Millisecond
+	timer := time.NewTimer(waitTime)
+	
+	for atomic.LoadInt32(&kv.dead) != 1 {
+		select {
+		case msg := <-kv.applyCh:
+			//fmt.Println("Message received: ", msg)
+			kv.apply(msg)
+			if !timer.Stop() {
+				<-timer.C
+			}
+			timer.Reset(waitTime)
+			
+		case <- timer.C:
+			timer.Reset(waitTime)
+		}
+	}
 }
 
 //
@@ -95,7 +252,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	kv.state = make(map[string]string)
+	kv.subs = make(map[Index]chan OpResult)
+	kv.reqIds = make(map[ClientId]RequestId)
+
+	go kv.loop()
 
 	return kv
 }

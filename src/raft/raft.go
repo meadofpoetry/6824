@@ -825,7 +825,7 @@ func (rf *Raft) loop() {
 			}
 		case StatusLeader:
 			go rf.appendLog()
-			time.Sleep(60 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 }
