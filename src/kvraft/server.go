@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	//"fmt"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,35 @@ type KVServer struct {
 	reqIds  map[ClientId]RequestId
 }
 
+func (kv *KVServer) serialize() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.state)
+	e.Encode(kv.reqIds)
+	return w.Bytes()
+}
+
+func (kv *KVServer) deserialize(data []byte) {
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kv.state) != nil {
+		panic("bad state")
+	}
+	if d.Decode(&kv.reqIds) != nil {
+		panic("bad state (subscriptions)")
+	}
+}
+
+func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {
+	if !msg.SnapshotValid {
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	kv.deserialize(msg.Snapshot)
+}
+
 func (kv *KVServer) apply(msg raft.ApplyMsg) {
 	if !msg.CommandValid {
 		return
@@ -92,6 +122,10 @@ func (kv *KVServer) apply(msg raft.ApplyMsg) {
 				kv.state[op.Key] = kv.state[op.Key] + op.Value
 			}
 		}
+	}
+
+	if kv.maxraftstate != -1 && kv.rf.RaftStateSize() > kv.maxraftstate {
+		kv.rf.Snapshot(index, kv.serialize())
 	}
 
 	resultCh, stillWaiting := kv.subs[Index(index)]
@@ -195,8 +229,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // to suppress debug output from a Kill()ed instance.
 //
 func (kv *KVServer) Kill() {
-	atomic.StoreInt32(&kv.dead, 1)
-	kv.rf.Kill()
+	atomic.StoreInt32(&kv.dead, 1)	
 }
 
 func (kv *KVServer) killed() bool {
@@ -212,6 +245,7 @@ func (kv *KVServer) loop() {
 		select {
 		case msg := <-kv.applyCh:
 			//fmt.Println("Message received: ", msg)
+			kv.applySnapshot(msg)
 			kv.apply(msg)
 			if !timer.Stop() {
 				<-timer.C
@@ -222,6 +256,7 @@ func (kv *KVServer) loop() {
 			timer.Reset(waitTime)
 		}
 	}
+	kv.rf.Kill()
 }
 
 //
@@ -249,7 +284,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 256)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.state = make(map[string]string)

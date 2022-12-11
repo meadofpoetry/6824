@@ -288,6 +288,23 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+func (rf *Raft) readSnapshot(data []byte) {
+	if data == nil || len(data) == 0 {
+		return
+	}
+
+	msg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot: data,
+		SnapshotTerm:  rf.baseEntry().Term,
+		SnapshotIndex: rf.baseEntry().Index,
+	}
+	rf.chanApply <- msg
+}
+
+func (rf *Raft) RaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
 
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -911,7 +928,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	//rf.readSnapshot(persister.ReadSnapshot())
+	rf.readSnapshot(persister.ReadSnapshot())
 
 	//rf.log("(re)started with state: Status: %s, Committed: %d, Log: %s", rf.status, rf.commitIndex, rf.mlog)
 
